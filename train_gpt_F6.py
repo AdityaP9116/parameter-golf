@@ -516,11 +516,38 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class STEQuantizeF6(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight: Tensor) -> Tensor:
+        weight_32 = weight.float()
+        clip_abs = (
+            torch.quantile(weight_32.abs(), INT8_CLIP_Q, dim=1)
+            if weight_32.numel()
+            else torch.empty((weight_32.shape[0],), dtype=torch.float32, device=weight.device)
+        )
+        scale = clip_abs.clamp_min(1e-9)
+        clipped = torch.maximum(torch.minimum(weight_32, clip_abs[:, None]), -clip_abs[:, None])
+        mag = torch.abs(clipped) / scale[:, None]
+        compressed_mag = torch.log1p(31.0 * mag) / torch.log1p(torch.tensor(31.0, device=weight.device))
+        q = torch.clamp(torch.round(torch.sign(clipped) * compressed_mag * 31.0), -31, 31).to(torch.int8)
+        
+        q_mag_f = torch.abs(q.float()) / 31.0
+        decompressed_mag = (torch.exp(q_mag_f * torch.log1p(torch.tensor(31.0, device=q.device))) - 1.0) / 31.0
+        q_val = torch.sign(q.float()) * decompressed_mag
+        
+        fake_quantized = q_val * scale[:, None]
+        return fake_quantized.to(dtype=weight.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        return grad_output
+
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Apply F6 QAT during forward pass
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        w_qat = STEQuantizeF6.apply(self.weight)
+        return F.linear(x, w_qat.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -708,7 +735,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        emb_q = STEQuantizeF6.apply(self.tok_emb.weight)
+        x = F.embedding(input_ids, emb_q)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -725,7 +753,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, emb_q)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
