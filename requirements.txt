@@ -9,3 +9,4 @@ datasets
 tiktoken
 sentencepiece
 ninja
+zstandard
