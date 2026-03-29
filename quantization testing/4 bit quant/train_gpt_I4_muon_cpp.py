@@ -412,7 +412,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty_like(t32[..., 0:1])
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs), -clip_abs)
-        scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
+        scale = (clip_abs / 7.0).clamp_min(1e-5)
         q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8).contiguous()
         return q, scale.squeeze(-1).to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
@@ -600,7 +600,7 @@ class STEQuantizeI4(torch.autograd.Function):
             else torch.empty_like(weight_32[..., 0:1])
         )
         clipped = torch.maximum(torch.minimum(weight_32, clip_abs), -clip_abs)
-        scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
+        scale = (clip_abs / 7.0).clamp_min(1e-5)
         q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8)
         
         fake_quantized = (q.float() * scale)

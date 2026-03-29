@@ -430,7 +430,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             
             # Broadcast bounds -> (chunk, 64)
             bounds = c_chunk * alpha_search
-            cand_scales = (bounds / 7.0).clamp_min(1.0 / 7.0) # (chunk, 64)
+            cand_scales = (bounds / 7.0).clamp_min(1e-5) # (chunk, 64)
             
             # W expanded: (chunk, features, 1), scales: (chunk, 1, 64)
             w_exp = w_chunk.unsqueeze(-1)
@@ -635,7 +635,7 @@ class STEQuantizeI4(torch.autograd.Function):
             else torch.empty_like(weight_32[..., 0:1])
         )
         clipped = torch.maximum(torch.minimum(weight_32, clip_abs), -clip_abs)
-        scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
+        scale = (clip_abs / 7.0).clamp_min(1e-5)
         q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8)
         
         fake_quantized = (q.float() * scale)
