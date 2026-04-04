@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -875,22 +880,38 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         
-        # SWA Masking: 1024x1024 consumes strictly 1 MB of memory structurally 
-        # meaning the Math Backend penalty is physically < 2ms per layer.
-        with torch.no_grad():
-            causal_mask = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device))
-            window_mask = torch.triu(causal_mask, diagonal=-256 + 1)
-        
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=window_mask,
-            is_causal=False,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        # Dual-Path Execution Mapping!
+        if flash_attn_func is not None:
+            # specifically exactly for flash-attn architectures: (bsz, seqlen, num_heads, head_dim)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            # Hardware SWA truncate loops physically natively overriding memory limits:
+            y = flash_attn_func(
+                q,
+                k,
+                v,
+                causal=True,
+                window_size=(256, -1)
+            )
+            y = y.contiguous().reshape(bsz, seqlen, dim)
+        else:
+            # SWA Masking Fallback avoiding T4 Colab explosions
+            with torch.no_grad():
+                causal_mask = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device))
+                window_mask = torch.triu(causal_mask, diagonal=-256 + 1)
+            
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=window_mask,
+                is_causal=False,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+            y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+            
         return F.linear(y, out_w.to(x.dtype))
 
 
