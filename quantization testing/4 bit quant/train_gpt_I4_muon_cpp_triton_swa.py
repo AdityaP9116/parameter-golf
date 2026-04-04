@@ -785,28 +785,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
-
-class STEQuantizeI4(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, weight: Tensor) -> Tensor:
-        weight_32 = weight.float()
-        clip_abs = (
-            torch.quantile(weight_32.abs(), INT8_CLIP_Q, dim=-1, keepdim=True)
-            if weight_32.numel()
-            else torch.empty_like(weight_32[..., 0:1])
-        )
-        clipped = torch.maximum(torch.minimum(weight_32, clip_abs), -clip_abs)
-        scale = (clip_abs / 7.0).clamp_min(1e-5)
-        q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8)
-        
-        fake_quantized = (q.float() * scale)
-        return fake_quantized.to(dtype=weight.dtype)
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        return grad_output
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -893,21 +871,17 @@ class CausalSelfAttention(nn.Module):
                 k,
                 v,
                 causal=True,
-                window_size=(256, -1)
+                window_size=(-1, -1)
             )
             y = y.contiguous().reshape(bsz, seqlen, dim)
         else:
-            # SWA Masking Fallback avoiding T4 Colab explosions
-            with torch.no_grad():
-                causal_mask = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device))
-                window_mask = torch.triu(causal_mask, diagonal=-256 + 1)
-            
+            # SWA Masking Fallback avoiding T4 Colab explosions natively using implicit causal!
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=window_mask,
-                is_causal=False,
+                attn_mask=None,
+                is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
             y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -1034,16 +1008,16 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        emb_q = STEQuantizeI4.apply(self.tok_emb.weight)
-        x = F.embedding(input_ids, emb_q)
+        emb_w = self.tok_emb.weight
+        x = F.embedding(input_ids, emb_w)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        qo = STEQuantizeI4.apply(self.qo_bank)
-        kv = STEQuantizeI4.apply(self.kv_bank)
-        up = STEQuantizeI4.apply(self.mlp_up_bank)
-        down = STEQuantizeI4.apply(self.mlp_down_bank)
+        qo = self.qo_bank
+        kv = self.kv_bank
+        up = self.mlp_up_bank
+        down = self.mlp_down_bank
         n = self.num_layers
 
         # First half stores skips; second half reuses them in reverse order.
@@ -1065,11 +1039,11 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, emb_q)
+            logits_proj = F.linear(x, emb_w)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = F.linear(x, STEQuantizeI4.apply(self.lm_head.weight))
+            logits_proj = F.linear(x, self.lm_head.weight)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
