@@ -580,6 +580,11 @@ class TokenStream:
             eos_mask = (tokens == self.eos_id)
             eos_indices = eos_mask.nonzero(as_tuple=True)[0]
             
+            # CRITICAL FALLBACK: If the bin file has NO EOS dividers, it would previously infinitely accumulate
+            # causing extreme RAM usage and stalling the while True loop forever without yielding.
+            if len(eos_indices) == 0:
+                eos_indices = torch.tensor([len(tokens) - 1], dtype=torch.int64)
+            
             start = 0
             for eos_idx in eos_indices:
                 segment = tokens[start : eos_idx + 1]
@@ -1288,7 +1293,9 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
+    log0(">>> Booting up Distributed Token Loader... (If it stalls here, the dataset parsing has failed)")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, sp.eos_id())
+    log0(">>> Data stream online! Loading the first chunking payload...")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,6 +1320,7 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        log0(">>> Spinning up Initial torch.compile() matrix optimization paths... this takes ~3 minutes... please wait!")
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
