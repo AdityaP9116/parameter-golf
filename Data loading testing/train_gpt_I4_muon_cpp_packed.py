@@ -938,8 +938,31 @@ class CausalSelfAttention(nn.Module):
             )
             y = y.contiguous().reshape(total_tokens, dim)
         else:
-            raise RuntimeError("Varlen packed arrays testing requires flash_attn installed on this runpod container natively!")
-            
+            # Native PyTorch SDPA fallback for environments without flash_attn
+            num_seqs = cu_seqlens.shape[0] - 1
+            q_b = q.new_zeros(num_seqs, max_seqlen, self.num_heads, self.head_dim)
+            k_b = k.new_zeros(num_seqs, max_seqlen, self.num_kv_heads, self.head_dim)
+            v_b = v.new_zeros(num_seqs, max_seqlen, self.num_kv_heads, self.head_dim)
+            for i in range(num_seqs):
+                s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
+                length = e - s
+                q_b[i, :length] = q[s:e]
+                k_b[i, :length] = k[s:e]
+                v_b[i, :length] = v[s:e]
+            # SDPA expects (batch, heads, seq, head_dim)
+            q_b = q_b.transpose(1, 2)
+            k_b = k_b.transpose(1, 2)
+            v_b = v_b.transpose(1, 2)
+            y_b = F.scaled_dot_product_attention(q_b, k_b, v_b, is_causal=True)
+            y_b = y_b.transpose(1, 2)  # back to (batch, seq, heads, head_dim)
+            # Unpack back to flat [total_tokens, dim]
+            y_parts = []
+            for i in range(num_seqs):
+                s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
+                length = e - s
+                y_parts.append(y_b[i, :length])
+            y = torch.cat(y_parts, dim=0).reshape(total_tokens, dim)
+
         return F.linear(y, out_w.to(x.dtype))
 
 
@@ -1224,7 +1247,8 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    _use_fullgraph = flash_attn_varlen_func is not None
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_use_fullgraph)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
