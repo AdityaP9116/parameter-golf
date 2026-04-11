@@ -410,12 +410,13 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim >= 2:
+        t32_gpu = t32.cuda()
         # ParoQuant Pipeline: 1. Fused FWHT Rotation Smoothing
-        if t32.shape[-1] == 512:
-            rotated = execute_fwht_triton(t32)
+        if t32_gpu.shape[-1] == 512:
+            rotated = execute_fwht_triton(t32_gpu)
             qmeta_scheme = "paroquant"
         else:
-            rotated = t32
+            rotated = t32_gpu
             qmeta_scheme = "per_row"
             
         # ParoQuant Pipeline: 2. 4-Bit MSE Micrometer Grid Search natively inside hardware Cache
@@ -425,7 +426,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         # Symmetrical Quantization explicitly mapping to 4-bit [-7, 7] ranges natively mapped
         clipped = torch.maximum(torch.minimum(rotated, scale * 7.0), -scale * 7.0)
         q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8).contiguous()
-        return q, best_scales.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q.cpu(), best_scales.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous().cpu()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
