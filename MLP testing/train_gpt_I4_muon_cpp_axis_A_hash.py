@@ -1325,12 +1325,7 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    try:
-        from flash_attn import flash_attn_varlen_func
-        _use_fullgraph = True
-    except ImportError:
-        _use_fullgraph = False
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_use_fullgraph)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:

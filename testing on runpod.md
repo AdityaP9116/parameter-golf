@@ -19,8 +19,13 @@ git clone https://github.com/AdityaP9116/parameter-golf.git
 cd parameter-golf
 ```
 
-### Step 4: Download the FineWeb Dataset
-You must fetch the dataset caches and tokenizer payloads directly onto the remote container. Run the provided download script specifically passing the 1024-token vocabulary switch:
+### Step 4: Install Missing Dependencies & Download the FineWeb Dataset
+Sometimes default templates miss the data-fetching packages. Inside the `parameter-golf` directory, install them first:
+```bash
+pip install -r requirements.txt
+```
+
+Once installed, fetch the dataset caches and tokenizer payloads directly onto the remote container. Run the provided download script specifically passing the 1024-token vocabulary switch:
 ```bash
 python3 data/cached_challenge_fineweb.py --variant sp1024
 ```
