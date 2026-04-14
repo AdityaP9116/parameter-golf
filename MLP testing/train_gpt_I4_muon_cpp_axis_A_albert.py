@@ -33,6 +33,11 @@ try:
 except ImportError:
     flash_attn_func = None
 
+def apply_i4_ste(weight: Tensor) -> Tensor:
+    scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 7.0
+    quantized_weight = torch.round(weight / scale) * scale
+    return (quantized_weight - weight).detach() + weight
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -1042,11 +1047,11 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        qo = self.qo_bank
-        kv = self.kv_bank
-        gate = self.mlp_gate_bank
-        up = self.mlp_up_bank
-        down = self.mlp_down_bank
+        qo = apply_i4_ste(self.qo_bank)
+        kv = apply_i4_ste(self.kv_bank)
+        gate = apply_i4_ste(self.mlp_gate_bank)
+        up = apply_i4_ste(self.mlp_up_bank)
+        down = apply_i4_ste(self.mlp_down_bank)
         n = self.num_layers
 
         for i in range(self.num_encoder_layers):
