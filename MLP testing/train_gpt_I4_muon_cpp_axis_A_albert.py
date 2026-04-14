@@ -1321,7 +1321,9 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=True)
+    # torch.compile disabled: PyTorch 2.4.1 Triton has bugs with ALBERT banking + select_backward
+    # Re-enable once PyTorch is upgraded or model is validated
+    compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
