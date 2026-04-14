@@ -718,13 +718,17 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # Manually expand KV heads for GQA (avoids enable_gqa kwarg which requires PyTorch 2.5+)
+        if self.num_kv_heads != self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return F.linear(y, out_w.to(x.dtype))
@@ -904,10 +908,11 @@ def main() -> None:
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # Only use DDP when actually multi-GPU — torchrun sets RANK/WORLD_SIZE even for nproc=1
+    distributed = world_size > 1
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
@@ -919,16 +924,24 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        try:
+            dist.init_process_group(backend="nccl", device_id=device)
+        except TypeError:
+            # PyTorch < 2.5 does not support device_id kwarg
+            dist.init_process_group(backend="nccl")
         dist.barrier()
     master_process = rank == 0
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    from torch.backends.cuda import enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    try:
+        from torch.backends.cuda import enable_cudnn_sdp
+        enable_cudnn_sdp(False)
+    except ImportError:
+        pass  # PyTorch < 2.4 doesn't have enable_cudnn_sdp
 
-    enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
