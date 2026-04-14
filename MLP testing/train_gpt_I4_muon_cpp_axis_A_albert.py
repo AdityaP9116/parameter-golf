@@ -23,6 +23,8 @@ import numpy as np
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
+import torch._dynamo
+torch._dynamo.config.optimize_ddp = False
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1318,7 +1320,6 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    torch._dynamo.config.optimize_ddp = False
     compiled_model = torch.compile(base_model, dynamic=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1425,7 +1426,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y, pos_ids, cu_seqlens, max_seqlen = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     warmup_loss = model(x, y, pos_ids, cu_seqlens, max_seqlen)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1493,7 +1494,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y, pos_ids, cu_seqlens, max_seqlen = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 loss = model(x, y, pos_ids, cu_seqlens, max_seqlen)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
