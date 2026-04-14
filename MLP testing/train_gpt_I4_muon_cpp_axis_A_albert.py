@@ -30,9 +30,10 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 except ImportError:
     flash_attn_func = None
+    flash_attn_varlen_func = None
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -961,11 +962,6 @@ class CausalSelfAttention(nn.Module):
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
         
-        try:
-            from flash_attn import flash_attn_varlen_func
-        except ImportError:
-            flash_attn_varlen_func = None
-            
         if flash_attn_varlen_func is not None:
             try:
                 # XSA execution: strict sliding exclusion window natively blocking self-tokens
@@ -1325,7 +1321,7 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False)
+    compiled_model = torch.compile(base_model, dynamic=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
