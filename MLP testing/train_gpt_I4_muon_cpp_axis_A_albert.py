@@ -541,7 +541,8 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             
             # ParoQuant Pipeline: Exactly executing the mathematically equivalent structural inverse Fused FWHT operation natively!
             if scheme == "paroquant":
-                out[name] = execute_fwht_triton(recon).to(dtype=dtype).contiguous()
+                recon_device = recon.cuda() if not recon.is_cuda else recon
+                out[name] = execute_fwht_triton(recon_device).to(dtype=dtype).cpu().contiguous()
             else:
                 out[name] = recon.to(dtype=dtype).contiguous()
         else:
