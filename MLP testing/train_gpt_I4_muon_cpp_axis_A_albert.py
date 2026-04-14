@@ -24,16 +24,14 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch._dynamo
-torch._dynamo.config.optimize_ddp = False
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_func
 except ImportError:
     flash_attn_func = None
-    flash_attn_varlen_func = None
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -357,18 +355,11 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             
-            B, T = x.shape
-            x_flat = x.reshape(-1)
-            y_flat = y.reshape(-1)
-            pos_x = torch.arange(T, device=device).unsqueeze(0).expand(B, T).reshape(-1)
-            cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=device)
-            max_seqlen = T
-            
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if is_final_eval:
-                    batch_loss = model(x_flat, y_flat, pos_x, cu_seqlens, max_seqlen)
+                    batch_loss = model(x, y)
                 else:
-                    batch_loss = model(x_flat, y_flat, pos_x, cu_seqlens, max_seqlen).detach()
+                    batch_loss = model(x, y).detach()
             
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.detach().to(torch.float64) * batch_token_count
@@ -579,133 +570,50 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np)
 
 class TokenStream:
-    def __init__(self, pattern: str, eos_id: int):
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.eos_id = eos_id
-        self._gen = self._stream_generator()
-        self.cache_toks = torch.empty(0, dtype=torch.int64)
-        self.cache_pos = torch.empty(0, dtype=torch.int64)
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
 
-    def _stream_generator(self):
-        file_idx = 0
-        rem_doc = torch.empty(0, dtype=torch.int64)
-        while True:
-            file = self.files[file_idx]
-            tokens = load_data_shard(file).to(torch.int64)
-            file_idx = (file_idx + 1) % len(self.files)
-            
-            eos_mask = (tokens == self.eos_id)
-            eos_indices = eos_mask.nonzero(as_tuple=True)[0]
-            
-            if len(eos_indices) == 0:
-                eos_indices = torch.tensor([len(tokens) - 1], dtype=torch.int64)
-            
-            start = 0
-            for eos_idx in eos_indices:
-                segment = tokens[start : eos_idx + 1]
-                if len(rem_doc) > 0:
-                    full_doc = torch.cat([rem_doc, segment])
-                    rem_doc = torch.empty(0, dtype=torch.int64)
-                else:
-                    full_doc = segment
-                
-                # Strided Slicing Chunk Logic
-                if len(full_doc) <= 1024:
-                    yield full_doc
-                else:
-                    idx = 0
-                    while len(full_doc) - idx > 1024:
-                        yield full_doc[idx : idx + 1024]
-                        idx += 824 # 1024 - 200 stride overlap
-                    rem = full_doc[idx:]
-                    if len(rem) > 0:
-                        yield rem # remainder
-                start = eos_idx + 1
-            
-            if start < len(tokens):
-                rem_doc = torch.cat([rem_doc, tokens[start:]])
+    def _advance_file(self) -> None:
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
 
-    def take(self, n: int) -> tuple[Tensor, Tensor]:
-        while len(self.cache_toks) < n:
-            seq = next(self._gen)
-            self.cache_toks = torch.cat([self.cache_toks, seq])
-            pos = torch.arange(len(seq), dtype=torch.int64)
-            self.cache_pos = torch.cat([self.cache_pos, pos])
-            
-        out_toks = self.cache_toks[:n]
-        out_pos = self.cache_pos[:n]
-        self.cache_toks = self.cache_toks[n:]
-        self.cache_pos = self.cache_pos[n:]
-        return out_toks, out_pos
+    def take(self, n: int) -> Tensor:
+        chunks: list[Tensor] = []
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-
-import threading
-import queue
 
 class DistributedTokenLoader:
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, eos_id: int):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, eos_id)
-        
-        self.queue = queue.Queue(maxsize=1)
-        self.cuda_stream = torch.cuda.Stream(device=device)
-        self.prefetch_thread = None
-        self.pin_toks = None
-        self.pin_pos = None
+        self.stream = TokenStream(pattern)
 
-    def _prefetch_worker(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        
-        self.pin_toks = torch.empty(per_rank_span, dtype=torch.int64, pin_memory=True)
-        self.pin_pos = torch.empty(per_rank_span, dtype=torch.int64, pin_memory=True)
-        
-        while True:
-            chunk_toks, chunk_pos = self.stream.take(per_rank_span * self.world_size)
-            start = self.rank * per_rank_span
-            
-            self.pin_toks.copy_(chunk_toks[start : start + per_rank_span])
-            self.pin_pos.copy_(chunk_pos[start : start + per_rank_span])
-            
-            x = self.pin_toks[:-1].reshape(-1)
-            y = self.pin_toks[1:].reshape(-1)
-            pos_x = self.pin_pos[:-1].reshape(-1)
-            
-            boundary_indices = (pos_x == 0).nonzero(as_tuple=True)[0].to(torch.int32)
-            if len(boundary_indices) == 0 or boundary_indices[0] != 0:
-                boundary_indices = torch.cat([torch.tensor([0], dtype=torch.int32), boundary_indices])
-            cu_seqlens = torch.cat([boundary_indices, torch.tensor([local_tokens], dtype=torch.int32)])
-            
-            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = int(seq_lengths.max().item()) if len(seq_lengths) > 0 else 0
-            
-            x_16 = x.to(torch.int16)
-            y_16 = y.to(torch.int16)
-            
-            with torch.cuda.stream(self.cuda_stream):
-                x_gpu = x_16.to(self.device, non_blocking=True).to(torch.int64)
-                y_gpu = y_16.to(self.device, non_blocking=True).to(torch.int64)
-                pos_x_gpu = pos_x.to(self.device, non_blocking=True)
-                cu_seqlens_gpu = cu_seqlens.to(self.device, non_blocking=True)
-            
-            self.queue.put((x_gpu, y_gpu, pos_x_gpu, cu_seqlens_gpu, max_seqlen))
-
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
-        if self.prefetch_thread is None:
-            self.prefetch_thread = threading.Thread(
-                target=self._prefetch_worker, 
-                args=(global_tokens, seq_len, grad_accum_steps),
-                daemon=True
-            )
-            self.prefetch_thread.start()
-            
-        x, y, pos_x, cu_seqlens, max_seqlen = self.queue.get()
-        torch.cuda.current_stream().wait_stream(self.cuda_stream)
-        return x, y, pos_x, cu_seqlens, max_seqlen
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 # -----------------------------
 # FUSED 4-BIT PTQ TRITON PIPELINE
 # -----------------------------
@@ -899,17 +807,34 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, base: float = 10000.0, max_seq_len: int = 32768):
+    def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        self.register_buffer("cos_table", freqs.cos(), persistent=False)
-        self.register_buffer("sin_table", freqs.sin(), persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
 
-    def forward(self, pos_x: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        return self.cos_table[pos_x].to(dtype), self.sin_table[pos_x].to(dtype)
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached != seq_len
+            or self._cos_cached.device != device
+        ):
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._seq_len_cached = seq_len
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
+def apply_partial_rotary(t: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    rot_dim = cos.size(-1) * 2
+    t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+    x1, x2 = t_rot.chunk(2, dim=-1)
+    t_rot_out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    return torch.cat((t_rot_out, t_pass), dim=-1)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -935,87 +860,35 @@ class CausalSelfAttention(nn.Module):
         # Axis A: Partial RoPE limited strictly to the first 25% of hidden dimensions
         self.rotary = Rotary(self.head_dim // 4, base=rope_base)
 
-    def forward(self, x: Tensor, pos_x: Tensor, cu_seqlens: Tensor, max_seqlen: int, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor) -> Tensor:
-        Tot, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).view(Tot, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).view(Tot, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype)).view(Tot, self.num_kv_heads, self.head_dim)
+    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
         q = F.rms_norm(q, (self.head_dim,))
         k = F.rms_norm(k, (self.head_dim,))
         
-        cos, sin = self.rotary(pos_x, q.dtype)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1) # [Tot, 1, rot_dim // 2]
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_partial_rotary(q, cos, sin)
+        k = apply_partial_rotary(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         
-        def apply_partial_rotary(t: Tensor) -> Tensor:
-            rot_dim = cos.size(-1) * 2
-            t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-            x1, x2 = t_rot.chunk(2, dim=-1)
-            t_rot_out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
-            return torch.cat((t_rot_out, t_pass), dim=-1)
-
-        q = apply_partial_rotary(q) * self.q_gain.to(dtype=q.dtype)[None, :, None]
-        k = apply_partial_rotary(k)
-        
-        # Explicitly force bfloat16 to prevent FlashAttention fp32 crashes
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
-        
-        if flash_attn_varlen_func is not None:
-            try:
-                # XSA execution: strict sliding exclusion window natively blocking self-tokens
-                y = flash_attn_varlen_func(
-                    q, k, v,
-                    cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-                    dropout_p=0.0, causal=True, window_size=(-1, -1)
-                )
-            except Exception:
-                # XSA fallback matching directive constraint to standard causal sequence parsing
-                y = flash_attn_varlen_func(
-                    q, k, v,
-                    cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-                    dropout_p=0.0, causal=True
-                )
-            y = y.contiguous().view(Tot, dim)
+        if flash_attn_func is not None:
+            # flash_attn expects (batch, seqlen, heads, head_dim)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            y = flash_attn_func(q, k, v, dropout_p=0.0, causal=True)
+            y = y.contiguous().reshape(bsz, seqlen, dim)
         else:
-            # Native PyTorch SDPA fallback for environments without flash_attn
-            num_seqs = cu_seqlens.shape[0] - 1
-            q_b = q.new_zeros(num_seqs, max_seqlen, self.num_heads, self.head_dim)
-            k_b = k.new_zeros(num_seqs, max_seqlen, self.num_kv_heads, self.head_dim)
-            v_b = v.new_zeros(num_seqs, max_seqlen, self.num_kv_heads, self.head_dim)
-            
-            for i in range(num_seqs):
-                s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
-                length = e - s
-                q_b[i, :length] = q[s:e]
-                k_b[i, :length] = k[s:e]
-                v_b[i, :length] = v[s:e]
-
-            # 2. Calculate the repetition ratio
-            num_queries_per_kv = self.num_heads // self.num_kv_heads
-            
-            # 3. Virtually broadcast Keys and Values
-            # This expands the [batch, seq, 2, 64] tensors to [batch, seq, 8, 64] using 0 extra parameters
-            k_expanded = k_b.repeat_interleave(num_queries_per_kv, dim=2)
-            v_expanded = v_b.repeat_interleave(num_queries_per_kv, dim=2)
-
-            q_b_t = q_b.transpose(1, 2)
-            k_expanded_t = k_expanded.transpose(1, 2)
-            v_expanded_t = v_expanded.transpose(1, 2)
-            
-            # 4. Execute standard attention
-            y_b = F.scaled_dot_product_attention(q_b_t, k_expanded_t, v_expanded_t, is_causal=True)
-            y_b = y_b.transpose(1, 2)
-            
-            y_parts = []
-            for i in range(num_seqs):
-                s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
-                length = e - s
-                y_parts.append(y_b[i, :length])
-            y = torch.cat(y_parts, dim=0).view(Tot, dim)
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+            y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
         return F.linear(y, out_w.to(x.dtype))
 
@@ -1057,16 +930,16 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, pos_x: Tensor, cu_seqlens: Tensor, max_seqlen: int, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, gate_w: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, gate_w: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, :] * x + mix[1][None, :] * x0
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         
         # Parallel Residual Computation Mapping
         z = self.ln(x_in)
-        attn_out = self.attn(z, pos_x, cu_seqlens, max_seqlen, q_w, k_w, v_w, out_w)
+        attn_out = self.attn(z, q_w, k_w, v_w, out_w)
         mlp_out = self.mlp(z, gate_w, up_w, down_w)
         
-        x = x_in + (self.attn_scale.to(dtype=z.dtype)[None, :] * attn_out) + (self.mlp_scale.to(dtype=z.dtype)[None, :] * mlp_out)
+        x = x_in + (self.attn_scale.to(dtype=z.dtype)[None, None, :] * attn_out) + (self.mlp_scale.to(dtype=z.dtype)[None, None, :] * mlp_out)
         return x
 
 
@@ -1156,7 +1029,7 @@ class GPT(nn.Module):
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, pos_x: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x_tiny = self.tok_dict(input_ids)
         x = self.tok_proj(x_tiny)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1174,19 +1047,19 @@ class GPT(nn.Module):
             q_w, out_w = qo[i], qo[i + n] # Change 0 and 1 to i and i+n
             k_w, v_w = kv[i], kv[i + n]
             gate_w, up_w, down_w = gate[i], up[i], down[i]
-            x = self.blocks[i](x, x0, pos_x, cu_seqlens, max_seqlen, q_w, k_w, v_w, out_w, gate_w, up_w, down_w)
+            x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, gate_w, up_w, down_w)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, :] * skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             idx = self.num_encoder_layers + i
             q_w, out_w = qo[idx], qo[idx + n]
             k_w, v_w = kv[idx], kv[idx + n]
             gate_w, up_w, down_w = gate[idx], up[idx], down[idx]
-            x = self.blocks[idx](x, x0, pos_x, cu_seqlens, max_seqlen, q_w, k_w, v_w, out_w, gate_w, up_w, down_w)
+            x = self.blocks[idx](x, x0, q_w, k_w, v_w, out_w, gate_w, up_w, down_w)
 
-        x = self.final_norm(x)
-        targets = target_ids
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             x_proj = F.linear(x, self.tok_proj.weight.t())
             logits_proj = F.linear(x_proj, self.tok_dict.weight)
@@ -1321,9 +1194,7 @@ def main() -> None:
         base_model.lm_head.weight.data = base_model.lm_head.weight.data.float()
 
     restore_low_dim_params_to_fp32(base_model)
-    # torch.compile disabled: PyTorch 2.4.1 Triton has bugs with ALBERT banking + select_backward
-    # Re-enable once PyTorch is upgraded or model is validated
-    compiled_model = base_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1398,7 +1269,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, sp.eos_id())
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1428,9 +1299,9 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y, pos_ids, cu_seqlens, max_seqlen = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    warmup_loss = model(x, y, pos_ids, cu_seqlens, max_seqlen)
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1443,7 +1314,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, sp.eos_id())
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1496,9 +1367,9 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y, pos_ids, cu_seqlens, max_seqlen = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                loss = model(x, y, pos_ids, cu_seqlens, max_seqlen)
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
