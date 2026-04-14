@@ -748,8 +748,9 @@ def mse_micrometer_kernel(
         
         scale = tl.maximum(scale, 1e-5)
         
-        q = tl.math.round(w / scale)
-        q = tl.minimum(tl.maximum(q, -7.0), 7.0)
+        q_raw = w / scale
+        q_rounded = (q_raw + tl.where(q_raw >= 0, 0.5, -0.5)).to(tl.int32).to(tl.float32)
+        q = tl.minimum(tl.maximum(q_rounded, -7.0), 7.0)
         
         recon = q * scale
         err = w - recon
