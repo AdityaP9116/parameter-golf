@@ -874,6 +874,11 @@ class CausalSelfAttention(nn.Module):
         k = apply_partial_rotary(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         
+        # Explicitly force bfloat16 to prevent FlashAttention fp32 crashes
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        
         if flash_attn_func is not None:
             # flash_attn expects (batch, seqlen, heads, head_dim)
             q = q.transpose(1, 2)
