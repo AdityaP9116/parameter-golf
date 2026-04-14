@@ -20,9 +20,9 @@ cd parameter-golf
 ```
 
 ### Step 4: Install Missing Dependencies & Download the FineWeb Dataset
-Sometimes default templates miss the data-fetching packages. Inside the `parameter-golf` directory, install them first:
+Sometimes default templates miss the data-fetching packages. Inside the `parameter-golf` directory, install all required dependencies:
 ```bash
-pip install -r requirements.txt
+pip install numpy sentencepiece zstandard triton ninja huggingface_hub datasets tqdm flash-attn --no-build-isolation
 ```
 
 Once installed, fetch the dataset caches and tokenizer payloads directly onto the remote container. Run the provided download script specifically passing the 1024-token vocabulary switch:
