@@ -956,6 +956,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_partial_rotary(q) * self.q_gain.to(dtype=q.dtype)[None, :, None]
         k = apply_partial_rotary(k)
         
+        # Explicitly force bfloat16 to prevent FlashAttention fp32 crashes
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        
         try:
             from flash_attn import flash_attn_varlen_func
         except ImportError:
