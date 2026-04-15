@@ -32,6 +32,11 @@ try:
 except ImportError:
     flash_attn_func = None
 
+def apply_i4_ste(weight: Tensor) -> Tensor:
+    scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 7.0
+    quantized_weight = torch.round(weight / scale) * scale
+    return (quantized_weight - weight).detach() + weight
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -61,17 +66,17 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 7200.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     hash_buckets = int(os.environ.get("HASH_BUCKETS", 4096))
-    num_layers = int(os.environ.get("NUM_LAYERS", 14))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    num_heads = int(os.environ.get("NUM_HEADS", 16))
+    mlp_mult = int(os.environ.get("MLP_MULT", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -1160,11 +1165,11 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        qo = self.qo_bank
-        kv = self.kv_bank
-        gate = self.mlp_gate_bank
-        up = self.mlp_up_bank
-        down = self.mlp_down_bank
+        qo = apply_i4_ste(self.qo_bank)
+        kv = apply_i4_ste(self.kv_bank)
+        gate = apply_i4_ste(self.mlp_gate_bank)
+        up = apply_i4_ste(self.mlp_up_bank)
+        down = apply_i4_ste(self.mlp_down_bank)
         n = self.num_layers
 
         for i in range(self.num_encoder_layers):
@@ -1217,7 +1222,7 @@ def main() -> None:
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -1232,16 +1237,22 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        try:
+            dist.init_process_group(backend="nccl", device_id=device)
+        except TypeError:
+            dist.init_process_group(backend="nccl")
         dist.barrier()
     master_process = rank == 0
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-
-    enable_cudnn_sdp(False)
+    from torch.backends.cuda import enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    try:
+        from torch.backends.cuda import enable_cudnn_sdp
+        enable_cudnn_sdp(False)
+    except ImportError:
+        pass
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
