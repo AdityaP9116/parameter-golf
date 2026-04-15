@@ -67,7 +67,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 7200.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
@@ -436,6 +436,7 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim >= 2:
+        orig_shape = t32.shape
         t32_gpu = t32.cuda()
         # ParoQuant Pipeline: 1. Fused FWHT Rotation Smoothing
         if t32_gpu.shape[-1] == 512:
@@ -452,7 +453,10 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         # Symmetrical Quantization explicitly mapping to 4-bit [-7, 7] ranges natively mapped
         clipped = torch.maximum(torch.minimum(rotated, scale * 7.0), -scale * 7.0)
         q = torch.clamp(torch.round(clipped / scale), -7, 7).to(torch.int8).contiguous()
-        return q.cpu(), best_scales.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous().cpu()
+        # Reshape back to original shape so load_state_dict gets matching dimensions
+        q = q.cpu().reshape(orig_shape)
+        s_out = best_scales.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous().cpu().reshape(orig_shape[:-1])
+        return q, s_out
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
@@ -541,8 +545,10 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             
             # ParoQuant Pipeline: Exactly executing the mathematically equivalent structural inverse Fused FWHT operation natively!
             if scheme == "paroquant":
-                recon_device = recon.cuda() if not recon.is_cuda else recon
-                out[name] = execute_fwht_triton(recon_device).to(dtype=dtype).cpu().contiguous()
+                orig_shape = recon.shape
+                recon_2d = recon.reshape(-1, recon.shape[-1])
+                recon_device = recon_2d.cuda() if not recon_2d.is_cuda else recon_2d
+                out[name] = execute_fwht_triton(recon_device).reshape(orig_shape).to(dtype=dtype).cpu().contiguous()
             else:
                 out[name] = recon.to(dtype=dtype).contiguous()
         else:
